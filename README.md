@@ -1,116 +1,173 @@
 # High-Concurrency Hotel Reservation Engine
 
-Enterprise-grade hotel booking backend built with **Java 21 + Spring Boot 3**, designed around the hard problem that platforms like Booking.com/Airbnb/Expedia solve: **thousands of concurrent booking requests must never double-book a room.**
+An enterprise-grade, event-driven hotel booking backend in the spirit of Booking.com / Airbnb / Expedia. Built to demonstrate advanced **Java 21 + Spring Boot 3**, distributed concurrency control, Redis, Kafka, Docker, and clean system design.
 
-## Why this project is interesting
+> The centerpiece is a **concurrency-safe reservation engine** that prevents double booking under thousands of simultaneous requests using four layered strategies (Redis distributed lock -> pessimistic DB lock -> optimistic versioning + retry -> DB unique constraint).
 
-The booking path defends against double-booking with **four layers**, cheapest to strongest:
-
-| Layer | Mechanism | Purpose |
-|-------|-----------|---------|
-| 1 | **Redis distributed lock** (`SET NX PX` + Lua release) | Cross-instance gate. Repels competing requests before they hit the DB. Absorbs thundering herd. |
-| 2 | **Pessimistic DB lock** (`SELECT ... FOR UPDATE`) | Authoritative serialization on the room + inventory rows within a transaction. |
-| 3 | **Optimistic lock** (`@Version`) + **retry** | Detects races that slip past the lock (e.g. TTL expiry); caller retries with backoff. |
-| 4 | **Unique constraint** `(room_id, stay_date)` | Final database-level backstop against duplicate holds. |
-
-Transaction isolation is `REPEATABLE_READ` so availability can't shift underneath a booking mid-transaction. See [`docs/diagrams/booking-sequence.md`](docs/diagrams/booking-sequence.md).
+---
 
 ## Tech Stack
 
-Java 21 · Spring Boot 3.3 · Spring Security + JWT (access + refresh) · Spring Data JPA / Hibernate · PostgreSQL · Redis · Kafka · Flyway · MapStruct · Lombok · springdoc OpenAPI · Micrometer + Prometheus + Grafana · Docker Compose · JUnit 5 + Mockito + Testcontainers.
+| Layer | Technology |
+|-------|-----------|
+| Language / Framework | Java 21, Spring Boot 3.3 |
+| Security | Spring Security, JWT (access + refresh), BCrypt, method-level `@PreAuthorize` |
+| Persistence | Spring Data JPA, Hibernate, PostgreSQL, Flyway |
+| Caching / Locking | Redis (cache, session, distributed lock, rate limiting) |
+| Messaging | Apache Kafka (event-driven) |
+| Mapping / Boilerplate | MapStruct, Lombok |
+| Docs | springdoc OpenAPI / Swagger UI |
+| Testing | JUnit 5, Mockito, Testcontainers |
+| Observability | Actuator, Micrometer, Prometheus, Grafana |
+| Build / Run | Maven, Docker, Docker Compose |
 
-## Architecture
+---
 
-Layered / clean architecture:
+## Architecture (Layered + Clean)
 
 ```
-controller  -> REST + validation + @PreAuthorize (RBAC)
-service     -> business logic, transactions, the reservation engine
-repository  -> Spring Data JPA + locking queries
-domain      -> JPA entities + enums
-dto/mapper  -> request/response records, MapStruct
-concurrency -> Redis distributed lock
-payment     -> Strategy (gateways) + Factory (resolver)
-kafka/event -> publisher + consumers (Observer)
-scheduler   -> expiry sweeps + reports
+controller  ->  service  ->  repository  ->  PostgreSQL
+                   |
+                   +--> lock (Redis distributed lock)
+                   +--> payment (Strategy + Factory)
+                   +--> event  (Kafka producer)  --> consumers (analytics, notifications)
+                   +--> notification (Observer: Email / SMS)
 ```
 
-**Patterns used:** DTO, Repository, Service Layer, Builder (Lombok), Factory (`PaymentGatewayFactory`), Strategy (`PaymentGateway`), Observer (Kafka consumers). SOLID throughout: e.g. adding a new payment provider is a single new `@Component`.
+### Design patterns used
+- **DTO + Mapper (MapStruct)** — no entity leaks across the API boundary
+- **Repository / Service layer** — clean separation of concerns
+- **Builder** — entity + DTO construction (Lombok `@Builder`)
+- **Factory** — `PaymentGatewayFactory` resolves a gateway strategy
+- **Strategy** — `PaymentGatewayStrategy` (Razorpay / Stripe / PayPal)
+- **Observer** — `NotificationService` fans out to Email/SMS channels
+- **SOLID** throughout (single-responsibility services, DI, interface segregation)
 
-## Domain / Roles
+---
 
-- **CUSTOMER** — search, book, cancel
-- **HOTEL_MANAGER** — manage hotels, rooms, amenities, images
-- **ADMIN** — everything + dashboard analytics
+## The Concurrency Engine (core)
 
-Reservation lifecycle: `PENDING -> LOCK_ROOM -> PAYMENT_PENDING -> CONFIRMED -> CHECKED_IN -> CHECKED_OUT -> COMPLETED`, with `CANCELLED` releasing inventory automatically (also swept by a scheduled job when a payment hold expires).
+Double booking is prevented with **defense in depth**. Each layer catches races the previous one can miss:
 
-## Running locally
+1. **Redis distributed lock** (`DistributedLockService`) — cluster-wide mutex per room, acquired *before* the DB transaction. `SET NX PX` for atomic acquire-with-TTL; Lua compare-and-delete for safe release. Sheds contention early across all app instances.
+2. **Pessimistic DB lock** (`SELECT ... FOR UPDATE` on the exact `room_inventory` rows) — hard serialization at the source of truth for the contended (room, date) rows.
+3. **Optimistic locking** (`@Version` on inventory + reservation) **+ bounded retry** — for lower-contention updates without holding row locks.
+4. **Unique constraint** `(room_id, stay_date)` — the final DB backstop. Correctness never depends on app timing alone.
 
-### Everything via Docker Compose
+Transaction isolation is **READ_COMMITTED**, with strong locking scoped only to contended rows (not full SERIALIZABLE) to preserve throughput. See `ReservationService` for heavily-commented rationale on each strategy.
+
+### Reservation lifecycle
+
+```
+PENDING -> LOCK_ROOM -> PAYMENT_PENDING -> CONFIRMED -> CHECKED_IN -> CHECKED_OUT -> COMPLETED
+                              |
+                              +--(payment fails / expires)--> CANCELLED  (inventory auto-released)
+```
+
+A scheduler (`ReservationScheduler`) reclaims inventory from `PAYMENT_PENDING` reservations that blow past their payment window, and emits daily occupancy/revenue reports.
+
+---
+
+## Kafka events
+
+| Event | Topic | Consumed by |
+|-------|-------|-------------|
+| ReservationCreated | `reservation.created` | notifications |
+| ReservationConfirmed | `reservation.confirmed` | analytics |
+| ReservationCancelled | `reservation.cancelled` | analytics, notifications |
+| PaymentCompleted | `payment.completed` | notifications |
+| PaymentFailed | `payment.failed` | (extendable) |
+| InventoryUpdated | `inventory.updated` | analytics |
+
+---
+
+## Getting started
+
+### Run everything with Docker Compose
+
 ```bash
 docker compose up --build
 ```
-Brings up Postgres, Redis, Kafka + Zookeeper, Prometheus, Grafana, and the app.
 
-- API: http://localhost:8080
-- Swagger UI: http://localhost:8080/swagger-ui.html
-- Actuator health: http://localhost:8080/actuator/health
-- Prometheus: http://localhost:9090
-- Grafana: http://localhost:3000 (admin / admin)
+This starts Postgres, Redis, Zookeeper, Kafka, Prometheus, Grafana, and the app.
 
-### Run the app from your IDE
-Start just the infra, then run `HotelReservationApplication`:
+| Service | URL |
+|---------|-----|
+| API | http://localhost:8080 |
+| Swagger UI | http://localhost:8080/swagger-ui.html |
+| Actuator health | http://localhost:8080/actuator/health |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3000 (admin/admin) |
+
+### Run locally (infra in Docker, app in IDE)
+
 ```bash
 docker compose up postgres redis kafka zookeeper
-./mvnw spring-boot:run
+mvn spring-boot:run
 ```
 
-## Sample credentials (seeded via Flyway V2)
+### Seeded accounts (password: `password123`)
 
-| Role | Email | Password |
-|------|-------|----------|
-| ADMIN | admin@hotel.com | Password123! |
-| HOTEL_MANAGER | manager@hotel.com | Password123! |
-| CUSTOMER | customer@hotel.com | Password123! |
+| Role | Email |
+|------|-------|
+| ADMIN | admin@hotel.com |
+| HOTEL_MANAGER | manager@hotel.com |
+| CUSTOMER | customer@hotel.com |
 
-> The seeded BCrypt hashes are placeholders for demo shape. Register a fresh user via `/api/v1/auth/register` for guaranteed working login.
+---
 
-## API quickstart
+## API quick tour
 
 ```bash
-# Register
-curl -X POST localhost:8080/api/v1/auth/register -H 'Content-Type: application/json' \
-  -d '{"email":"jane@t.com","password":"Password123!","fullName":"Jane","role":"CUSTOMER"}'
+# 1. Login
+curl -X POST localhost:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"customer@hotel.com","password":"password123"}'
 
-# Book (use the accessToken from the response above)
-curl -X POST localhost:8080/api/v1/reservations -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer <TOKEN>" \
-  -d '{"roomId":2,"checkIn":"2026-09-10","checkOut":"2026-09-12","guests":2,"paymentProvider":"STRIPE"}'
+# 2. Book a room (use the returned accessToken)
+curl -X POST localhost:8080/api/v1/reservations \
+  -H 'Authorization: Bearer <TOKEN>' -H 'Content-Type: application/json' \
+  -d '{"roomId":1,"checkIn":"2026-08-01","checkOut":"2026-08-03","guests":2,"gateway":"STRIPE"}'
 ```
 
-A Postman collection lives in [`docs/postman`](docs/postman).
+A Postman collection lives in [`docs/postman_collection.json`](docs/postman_collection.json).
+
+---
 
 ## Testing
 
 ```bash
-./mvnw test
+mvn test
 ```
 
-- **Unit:** distributed lock behavior, payment factory/strategy.
-- **Integration:** auth flow via MockMvc + Testcontainers Postgres.
-- **Concurrency:** `ReservationConcurrencyIT` fires 20 simultaneous bookings at one room/date range and asserts **at most one** wins.
-- **Load:** k6 script in [`docs/load-test`](docs/load-test).
+- **Unit**: `JwtServiceTest`, `PaymentGatewayFactoryTest`
+- **Integration**: `AbstractIntegrationTest` (Testcontainers Postgres)
+- **Concurrency**: `ReservationConcurrencyTest` fires 20 simultaneous bookings at one room/date range and asserts at most one wins
+- **Load**: k6 script in [`docs/loadtest.k6.js`](docs/loadtest.k6.js)
 
-## Monitoring
+---
 
-Actuator exposes `/actuator/health`, `/actuator/metrics`, `/actuator/prometheus`. Prometheus scrapes the app; Grafana visualizes. Micrometer tags every metric with the application name.
+## Project structure
 
-## Diagrams
+```
+src/main/java/com/hotelreservation
+├── HotelReservationApplication.java
+├── config          # Security, Redis, Kafka topics, OpenAPI
+├── controller      # REST endpoints
+├── domain          # JPA entities + enums
+├── dto             # request/response records
+├── event           # Kafka events, producer, consumers
+├── exception       # global handler + custom errors
+├── lock            # Redis distributed lock
+├── mapper          # MapStruct mappers
+├── notification    # Observer channels (Email/SMS)
+├── payment         # Strategy + Factory (Razorpay/Stripe/PayPal)
+├── repository      # Spring Data JPA repos
+├── scheduler       # background jobs
+├── security        # JWT filter/service, user details
+└── service         # business logic incl. reservation engine
+src/main/resources/db/migration   # Flyway V1 schema, V2 seed
+docs/                              # diagrams, Postman, load test
+```
 
-- [Entity Relationship Diagram](docs/diagrams/erd.md)
-- [Booking Sequence Diagram](docs/diagrams/booking-sequence.md)
-
-## License
-
-MIT
+See [`docs/DIAGRAMS.md`](docs/DIAGRAMS.md) for the ERD and booking sequence diagram.
