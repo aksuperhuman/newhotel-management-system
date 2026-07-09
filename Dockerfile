@@ -7,10 +7,8 @@ COPY src ./src
 RUN mvn -B clean package -DskipTests
 
 # ---- Runtime stage ----
-FROM eclipse-temurin:21-jre-alpine
+FROM eclipse-temurin:21-jre-jammy
 WORKDIR /app
-RUN addgroup -S app && adduser -S app -G app
-COPY --from=build /app/target/reservation-engine-1.0.0.jar app.jar
-USER app
+COPY --from=build /app/target/hotel-reservation-engine-1.0.0.jar app.jar
 EXPOSE 8080
-ENTRYPOINT ["java", "-XX:+UseZGC", "-jar", "app.jar"]
+ENTRYPOINT ["java", "-jar", "app.jar"]

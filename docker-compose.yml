@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: hotel-postgres
+    container_name: hre-postgres
     environment:
       POSTGRES_DB: hotel_reservation
       POSTGRES_USER: hotel
@@ -11,14 +11,14 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hotel"]
+      test: ["CMD-SHELL", "pg_isready -U hotel -d hotel_reservation"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: hotel-redis
+    container_name: hre-redis
     ports:
       - "6379:6379"
     command: ["redis-server", "--appendonly", "yes"]
@@ -30,14 +30,14 @@ services:
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
-    container_name: hotel-zookeeper
+    container_name: hre-zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
 
   kafka:
     image: confluentinc/cp-kafka:7.6.1
-    container_name: hotel-kafka
+    container_name: hre-kafka
     depends_on:
       - zookeeper
     ports:
@@ -49,11 +49,10 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
 
   prometheus:
-    image: prom/prometheus:v2.53.0
-    container_name: hotel-prometheus
+    image: prom/prometheus:v2.53.1
+    container_name: hre-prometheus
     ports:
       - "9090:9090"
     volumes:
@@ -61,17 +60,18 @@ services:
 
   grafana:
     image: grafana/grafana:11.1.0
-    container_name: hotel-grafana
+    container_name: hre-grafana
     ports:
       - "3000:3000"
     environment:
+      GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
     depends_on:
       - prometheus
 
   app:
     build: .
-    container_name: hotel-app
+    container_name: hre-app
     depends_on:
       postgres:
         condition: service_healthy
@@ -82,10 +82,12 @@ services:
     ports:
       - "8080:8080"
     environment:
+      SPRING_PROFILES_ACTIVE: docker
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/hotel_reservation
       SPRING_DATASOURCE_USERNAME: hotel
       SPRING_DATASOURCE_PASSWORD: hotel_pass
       SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
 
 volumes:
